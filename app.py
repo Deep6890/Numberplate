@@ -2,119 +2,116 @@ import streamlit as st
 import cv2
 import numpy as np
 import pytesseract
-import os
 
-# Configure pytesseract for cloud deployment
-if os.path.exists("/usr/bin/tesseract"):
-    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-elif os.path.exists("C:\\Program Files\\Tesseract-OCR\\tesseract.exe"):
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-def process_image(image):
-    grayImg = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
-    kernel = np.ones((3,3), np.uint8)
-    eroded = cv2.erode(grayImg, kernel, iterations=1)
-    dilated = cv2.dilate(eroded, kernel, iterations=1)
-    
-    guassBlure = cv2.GaussianBlur(dilated, (5,5), 0)
-    edges = cv2.Canny(guassBlure, 280, 400)
-    bilateral = cv2.bilateralFilter(edges, 13, 55, 55)
-    
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+def detect_plate(image):
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    kernel = np.ones((3, 3), np.uint8)
+    eroded = cv2.erode(gray, kernel, 1)
+    dilated = cv2.dilate(eroded, kernel, 1)
+    blur = cv2.GaussianBlur(dilated, (5, 5), 0)
+    edges = cv2.Canny(blur, 250, 400)
+
+    bilateral = cv2.bilateralFilter(edges, 15, 55, 55)
     _, thresh = cv2.threshold(bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thresh = thresh.astype("uint8")
-    
-    ys, xs = np.where(thresh == 255)
-    
-    if len(xs) == 0 or len(ys) == 0:
-        return None, None, "❌ No plate detected"
-    
-    x1, x2 = np.min(xs), np.max(xs)
-    y1, y2 = np.min(ys), np.max(ys)
-    
-    cropped = grayImg[y1:y2+1, x1:x2+1]
-    
-    if cropped is None or cropped.size == 0:
-        return None, None, "❌ No plate detected"
-    
-    edges_crop = cv2.Canny(cropped, 60, 200)
-    cnts, _ = cv2.findContours(edges_crop, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
-    polygon_ok = False
-    for cnt in cnts:
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
-        if len(approx) == 4:
-            polygon_ok = True
-            break
-    
-    h, w = cropped.shape
-    aspect_ratio = w / float(h)
-    edge_density = np.sum(edges_crop > 0) / (h * w)
-    mean_brightness = np.mean(cropped)
-    
-    score = 0
-    if polygon_ok: score += 1
-    if 2.5 < aspect_ratio < 6.5: score += 1
-    if 0.02 < edge_density < 0.25: score += 1
-    if mean_brightness > 90: score += 1
-    
-    result = "🟩 NUMBER PLATE" if score >= 3 else "❌ NOT A PLATE"
-    
-    return cropped, (x1, y1, x2, y2), result
+
+    cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:10]
+
+    for c in cnts:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.028 * peri, True)
+
+        if len(approx) <= 4:
+            x, y, w, h = cv2.boundingRect(approx)
+            return image[y:y + h, x:x + w], (x, y, x + w, y + h)
+
+    return None, None
+
+
+def read_text(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+
+    thresh = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        35, 2
+    )
+
+    config = "-l eng --oem 3 --psm 7"
+    raw = pytesseract.image_to_string(thresh, config=config)
+    text = "".join(ch for ch in raw.upper() if ch.isalnum())
+
+    return text, thresh
+
+
+def fallback_ocr(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    avg_intensity = np.mean(gray)
+
+    if avg_intensity < 60:
+        return ""
+
+    config = "-l eng --oem 3 --psm 6"
+    raw = pytesseract.image_to_string(gray, config=config)
+    text = "".join(ch for ch in raw.upper() if ch.isalnum())
+
+    return text
+
 
 st.title("Vehicle Number Plate Detector")
-st.write("Upload an image to detect the number plate and read the text.")
+st.write("Upload an image to detect the number plate text.")
 
-uploaded = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png","webp"])
+uploaded = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png", "webp","avif"])
+
 if uploaded:
     file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
     image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    
-    draw_img = image.copy()
-    
+
     st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
              caption="Uploaded Image",
-             use_column_width=True)
-    
-    cropped, coords, result = process_image(image)
-    
-    st.header("Detection Result")
-    st.write(result)
-    
-    if cropped is not None and coords is not None:
+             use_container_width=True)
+
+    # Detect plate
+    plate, coords = detect_plate(image)
+
+    final_text = ""
+    display_img = image.copy()
+
+    if plate is not None:
         x1, y1, x2, y2 = coords
-        
-        cv2.rectangle(draw_img, (x1, y1), (x2, y2), (0,255,0), 3)
-        
-        st.image(
-            cv2.cvtColor(draw_img, cv2.COLOR_BGR2RGB),
-            caption="Detected Plate on Original Image",
-            use_column_width=True
-        )
-        
-        gray = cropped
-        blur = cv2.bilateralFilter(gray, 11, 17, 17)
-        
-        thresh = cv2.adaptiveThreshold(
-            blur, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            41, 2
-        )
-        
-        st.image(thresh, caption="Preprocessed for OCR", use_column_width=True)
-        
-        config = "-l eng --oem 3 --psm 7"
-        
-        try:
-            raw_text = pytesseract.image_to_string(thresh, config=config)
-            text = "".join(ch for ch in raw_text.upper() if ch.isalnum())
-            
-            st.subheader("Extracted Text:")
-            if text:
-                st.code(text)
-            else:
-                st.warning("OCR failed — try clearer image.")
-        except Exception as e:
-            st.error("OCR not available in this environment")
+        cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
+        text, ocr_view = read_text(plate)
+
+        if len(text) >= 6:
+            final_text = text
+        else:
+            fallback_text = fallback_ocr(image)
+            if len(fallback_text) >= 6:
+                final_text = fallback_text
+
+    else:
+        fallback_text = fallback_ocr(image)
+        if len(fallback_text) >= 6:
+            final_text = fallback_text
+    
+    if final_text:
+        st.success("Plate Text Detected !!!!!")
+        st.code(final_text)
+
+        cv2.putText(display_img, final_text, (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+
+        st.image(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB),
+                 caption="OCR Output",
+                 use_container_width=True)
+
+    else:
+        st.error("No plate detected in the gieven image")
